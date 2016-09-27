@@ -1,6 +1,6 @@
 {
   "name": "amqp-subpub",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Subscribe/Publish module with amqp",
   "main": "index.js",
   "scripts": {
