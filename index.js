@@ -28,80 +28,192 @@ evt定义
 /*
 	url - string, default to "amqp://localhost",
 	options - {
-		exchange : "EventStreamExchange"(default)
+		exchange : "EventStreamExchange"(default),
+		maxRetryTimes : -1,
+		autoReconnect : true
 	}
 */
 var SubPub = function (url, options) {
 	EventEmitter.call(this);
 	var self = this;
 
-	// exchange
+	// options
+	options = options || {};
 	var exchangeName_ = options.exchange || "EventStreamExchange";
+	var maxRetryTimes_ = options.maxRetryTimes === undefined ? -1 : options.maxRetryTimes;
+	var autoReconnect_ = options.autoReconnect === undefined ? true : options.autoReconnect;
+
+	// exchange	
 	var exchangeType_ = 'fanout';
 	var exchangeOptions_ = {durable: false};
 	// subscribe
 	var subId_ = null;
 
-	// sender
-	var sender_ = { conn:null, channel:null };
-	// receiver
-	var receiver_ = {conn:null, channel:null, queue:null };
+	// connection
+	var connection_, sender_, receiver_;
+	// status
+	var close_ = ready_ = block_ = false;
 
-	// initialization
-	this.init = function (){
+	// re-try times
+	var retry_ = 0;
+
+	// create sender and receiver channel
+	var createChannels = function (){
 		return co(function *(){
 			//
 			// sender
 			//
-			sender_.conn = yield amqp.connect(url);
-			sender_.channel = yield sender_.conn.createChannel();
+			sender_ = { channel:null };
+			sender_.channel = yield connection_.createChannel();
+			sender_.channel.on('drain', function (){
+				self.emit('drain');
+			});
 			yield sender_.channel.assertExchange(exchangeName_, exchangeType_, exchangeOptions_);
 
 			//
 			// receiver
 			//
-			receiver_.conn = yield amqp.connect(url);
-			receiver_.channel = yield sender_.conn.createChannel();
+			receiver_ = { channel:null, queue:null };
+			receiver_.channel = yield connection_.createChannel();
 			// assert exchange & queue
 			yield receiver_.channel.assertExchange(exchangeName_, exchangeType_, exchangeOptions_);
 			receiver_.queue = yield receiver_.channel.assertQueue("", {exclusive: true});
 
-			// emit ready
-			ready_ = true;
-			self.emit('ready');
 			return null;
-		}).catch(err => {
-			self.emit('error', err);
-		})
+		});
+	}
+
+	// reconnect
+	var tryConnect = function (){
+		return new Promise((resolve, reject) => {
+			retry_ = 0;
+			var connect = function (){
+				amqp.connect(url).then(function (connection){
+					resolve(connection);
+				}, function (err){
+					if (!ready_)
+						return reject(err);
+
+					if (maxRetryTimes_ === -1 || retry_++ < maxRetryTimes_){
+						// re-connect 5s
+						setTimeout(connect, 5000);
+					}
+					else{
+						reject(new Error('ER_MAX_RETRY_CONNECT'));
+					}
+				})
+			}
+
+			connect();
+		});
+	}
+
+	// initialization
+	var init = function (){
+		return co(function *(){
+			// connection
+			connection_ = yield tryConnect();
+			// do reconnection
+			connection_.on('close', function (err){
+				if (!autoReconnect_){
+					self.emit('close');
+					return;
+				}
+
+				//				
+				// NOTE:
+				// A graceful close may be initiated by an operator (e.g., with an admin tool), 
+				// or if the server is shutting down; in this case, no 'error' event will be emitted.
+				// But, 'close' will also be emitted, after 'error'	
+				//				
+				co(function *(){
+					// amqplib will close connection itself
+					close_ = true;
+					yield init();
+					
+					// re-sub if need
+					if (subId_){
+						subId_ = null;
+						yield self.sub();					
+					}
+
+					close_ = false;
+					if (block_){
+						block_ = false;
+						self.emit('drain');
+					}
+				}).catch(err => {
+					self.emit('error', err);
+				})
+			});
+
+			// Handle errors
+			// Emitted if the connection closes for a reason other than #close being called or a graceful server-initiated close;
+			// such reasons include:
+			// 		a protocol transgression the server detected (likely a bug in this library)
+			// 		a server error
+			// 		a network error
+			// 		the server thinks the client is dead due to a missed heartbeat
+			//
+			connection_.on('error', function (err){
+				self.emit('error', err);
+			});
+
+			// channels
+			yield createChannels();
+			
+			return null;
+		});
 	}
 
 	this.close = function(){
 		return co(function *(){
-			isClose = true;
+			close_ = true;
 			yield self.unsub();
 
 			// close sender
-			if (sender_.channel)
+			if (sender_ && sender_.channel){
 				yield sender_.channel.close();
-			if (sender_.conn)
-				yield sender_.conn.close();
-
+				sender_ = null;
+			}
 			// close 
-			if (receiver_.channel)
+			if (receiver_ && receiver_.channel){
 				yield receiver_.channel.close();
-			if (receiver_.conn)
-				yield receiver_.conn.close();
+				receiver_ = null;
+			}
+			// close connection
+			if (connection_){
+				yield connection_.close();
+				connection_.removeAllListeners();
+				connection_ = null;
+			}
+
+			// send close event
+			self.emit('close');
 		}).catch (err => {
 			self.emit('error', err);
 		});
 	}
 
+	//
+	// it will return false if the channel's write buffer is 'full' or 'disconnect'
+	// and true otherwise.
+	// If it returns false, it will emit a 'drain' event at some later time.
+	//
 	this.write = function(topic, evtClass, fields){
+		if (!ready_)
+			throw new Error('ER_NOT_READY');
+
 		var body = {
 			topic : topic,
 			class : evtClass,
 			fields : fields
 		};
+
+		if (close_){
+			block_ = true;
+			return false;
+		}
 
 		// send to exchange
 		// route key '' means to all subscribers
@@ -113,6 +225,9 @@ var SubPub = function (url, options) {
 
 	// 订阅新的事件通知
 	this.sub = function(){
+		if (!ready_)
+			throw new Error('ER_NOT_READY');
+
 		return co(function *(){
 			if (subId_)
 				return;
@@ -143,6 +258,8 @@ var SubPub = function (url, options) {
 
 	// 取消订阅新的事件通知
 	this.unsub = function() {
+		if (!ready_)
+			throw new Error('ER_NOT_READY');		
 		return co(function *(){
 			if (subId_){
 				var queueName = receiver_.queue.queue;
@@ -156,7 +273,16 @@ var SubPub = function (url, options) {
 	}
 
 	// Do initialization
-	this.init();
+	co(function *(){
+		yield init();
+
+		// emit ready
+		ready_ = true;
+		self.emit('ready');
+		return null;
+	}).catch(err => {
+		self.emit('error', err);
+	})
 }
 
 require('util').inherits(SubPub, EventEmitter);
